@@ -2,7 +2,16 @@
 from typing import Optional
 
 from ._base import DeviceRegistry
-from . import airconditioner, dishwasher, dryer, oven, range as _range, refrigerator, washer
+from . import (
+    airconditioner,
+    dehumidifier,
+    dishwasher,
+    dryer,
+    oven,
+    range as _range,
+    refrigerator,
+    washer,
+)
 
 __all__ = ['DeviceRegistry', '_type_key', 'for_device', 'for_device_by_model']
 
@@ -10,6 +19,7 @@ __all__ = ['DeviceRegistry', '_type_key', 'for_device', 'for_device_by_model']
 _REGISTRY_BY_KEY: dict[str, DeviceRegistry] = {
     'airconditioner': airconditioner.REGISTRY,
     'air_conditioner': airconditioner.REGISTRY,
+    'dehumidifier': dehumidifier.REGISTRY,
     'dishwasher': dishwasher.REGISTRY,
     'dryer': dryer.REGISTRY,
     'oven': oven.REGISTRY,
@@ -102,6 +112,11 @@ def for_device_by_model(model_num: str, description: str) -> Optional[DeviceRegi
     # 'P' sits between the underscore and 'RAC' in that token).
     if key is None and '_RAC_' in (model_num or ''):
         key = 'airconditioner'
+    # Samsung dehumidifiers in the TP1X DA_AC family report no oneUiVersion.
+    # Their stable appliance token is '_DHM_' (DeHuMidifier), for example
+    # TP1X_DA_AC_DHM_01001_0000.
+    if key is None and '_DHM_' in (model_num or '').upper():
+        key = 'dehumidifier'
     # Range/cooktop-oven combos (e.g. TP1X_DA-KS-RANGE-0102X, issue #44) --
     # like the RAC/PRAC air conditioners above, these report no oneUiVersion
     # and don't match the washer/dryer/dishwasher consumer-prefix map either.

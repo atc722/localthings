@@ -1,0 +1,18 @@
+{
+  "state_keys": [
+    "air_filter_status",
+    "air_filter_usage",
+    "alarm_code",
+    "auto_clean_enabled",
+    "auto_clean_status",
+    "current_humidity",
+    "energy_kwh",
+    "energy_saved_kwh",
+    "firmware_update",
+    "mode",
+    "power",
+    "power_watts",
+    "target_humidity",
+    "water_tank_full"
+  ]
+}

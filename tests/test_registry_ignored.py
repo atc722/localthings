@@ -10,7 +10,11 @@ import json
 from pathlib import Path
 
 from custom_components.localthings.registry.batch import parse_device0_batch
-from custom_components.localthings.registry.by_type import dishwasher, refrigerator
+from custom_components.localthings.registry.by_type import (
+    dehumidifier,
+    dishwasher,
+    refrigerator,
+)
 from custom_components.localthings.registry.capabilities.ignored import IGNORED
 
 FIXTURES = Path(__file__).resolve().parent / 'fixtures'
@@ -56,6 +60,12 @@ def test_dishwasher_fixture_has_no_remaining_gaps():
     """
     resources = _load('dishwasher_device.json')
     unbound = set(_unbound_hrefs(resources, dishwasher.REGISTRY))
+    assert unbound == set()
+
+
+def test_dehumidifier_fixture_has_no_remaining_gaps():
+    resources = _load('dehumidifier_device.json')
+    unbound = set(_unbound_hrefs(resources, dehumidifier.REGISTRY))
     assert unbound == set()
 
 

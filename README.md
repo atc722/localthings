@@ -17,6 +17,7 @@ Your state stays on your LAN: HA talks to the appliance over a direct DTLS sessi
 | Type | Registry |
 |---|---|
 | Air conditioner | `by_type/airconditioner.py` |
+| Dehumidifier (read-only) | `by_type/dehumidifier.py` |
 | Dryer | `by_type/dryer.py` |
 | Oven | `by_type/oven.py` |
 | Dishwasher | `by_type/dishwasher.py` |
