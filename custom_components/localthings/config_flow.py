@@ -8,6 +8,7 @@ import errno
 import json
 import logging
 import re
+import secrets
 import selectors
 import socket
 import ssl
@@ -51,6 +52,9 @@ from .const import (
     DEFAULT_FINISH_TIME_HYSTERESIS_MINUTES,
     DOMAIN,
     LIVENESS_PROBE_TIMEOUT_S,
+    OCF_DISCOVERY_PORT,
+    OCF_DISCOVERY_RETRIES,
+    OCF_DISCOVERY_TIMEOUT_S,
     PREFERRED_PROBE_PORTS,
     PROBE_GET_TIMEOUT_S,
     PROBE_MAX_WORKERS,
@@ -71,6 +75,8 @@ _HYSTERESIS_MINUTES = NumberSelector(
 _LOGGER = logging.getLogger(__name__)
 
 _SAMSUNG_CLOUD_HOST = "connect-v2.samsungiotcloud.com"
+_OCF_DISCOVERY_MAX_DATAGRAM_BYTES = 8192
+_OCF_DISCOVERY_MAX_PORTS = 8
 
 
 class CannotConnect(Exception):
@@ -371,15 +377,148 @@ def _sweep_ports(host: str, ports: list[int], timeout: float) -> tuple[_SweepRes
 class _PortScan:
     """What port detection learned about a host.
 
-    `candidates` is what gets a full DTLS handshake. The other two are kept
+    `candidates` is what gets a full DTLS handshake. The other fields are kept
     because they're the evidence behind a failure message: `confirmed` names
-    ports a DTLS server was *proven* on, and `swept` is the UDP sweep's own
+    ports a DTLS server was *proven* on, `advertised` names secure ports the
+    target's public OCF directory reported, and `swept` is the UDP sweep's own
     verdict (None when the sweep never had to run).
     """
 
     candidates: list[int]
     confirmed: list[int]
     swept: _SweepResult | None = None
+    advertised: tuple[int, ...] = ()
+
+
+def _advertised_secure_ports(payload: bytes) -> list[int]:
+    """Extract validated secure DOXM ports from an OCF discovery payload."""
+    import cbor2
+
+    try:
+        body = cbor2.loads(payload)
+    except (cbor2.CBORDecodeError, TypeError, ValueError):
+        return []
+
+    items = body if isinstance(body, list) else [body]
+    ports: set[int] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        links = item.get("links")
+        if not isinstance(links, list):
+            continue
+        for link in links:
+            if not isinstance(link, dict) or link.get("href") != "/oic/sec/doxm":
+                continue
+            resource_types = link.get("rt")
+            if isinstance(resource_types, str):
+                resource_types = [resource_types]
+            if not isinstance(resource_types, list) or "oic.r.doxm" not in resource_types:
+                continue
+            policy = link.get("p")
+            if not isinstance(policy, dict) or policy.get("sec") is not True:
+                continue
+            port = policy.get("port")
+            if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+                continue
+            ports.add(port)
+            if len(ports) >= _OCF_DISCOVERY_MAX_PORTS:
+                return sorted(ports)
+    return sorted(ports)
+
+
+def _discover_advertised_secure_ports(host: str) -> list[int]:
+    """Ask ``host`` for secure OCF ports advertised by its DOXM resource.
+
+    The request is unicast and read-only. Responses are accepted only when
+    they come from the resolved target IPv4 address, carry our unpredictable
+    CoAP token, return 2.05 Content, and contain a validated secure DOXM link.
+    The UDP source port is deliberately not checked: newer Samsung firmware
+    receives discovery on 5683 but sends its response from an ephemeral port.
+    """
+    from smartthings_local.protocol.coap import (
+        ACCEPT,
+        BLOCK2,
+        CF_CBOR,
+        METHOD_GET,
+        TYPE_NON,
+        URI_PATH,
+        URI_QUERY,
+        build_coap,
+        parse_coap,
+    )
+
+    addresses = {
+        info[4][0]
+        for info in socket.getaddrinfo(
+            host,
+            OCF_DISCOVERY_PORT,
+            family=socket.AF_INET,
+            type=socket.SOCK_DGRAM,
+        )
+    }
+    if not addresses:
+        return []
+
+    token = secrets.token_bytes(4)
+    per_attempt_timeout = OCF_DISCOVERY_TIMEOUT_S / max(OCF_DISCOVERY_RETRIES, 1)
+
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.settimeout(per_attempt_timeout)
+        for _ in range(max(OCF_DISCOVERY_RETRIES, 1)):
+            # Keep the token stable so a delayed response to either attempt
+            # remains correlated, but give each NON request a fresh MID so a
+            # peer's duplicate suppression cannot discard the retry.
+            request = build_coap(
+                TYPE_NON,
+                METHOD_GET,
+                secrets.randbits(16),
+                token,
+                [
+                    (URI_PATH, b"oic"),
+                    (URI_PATH, b"res"),
+                    (URI_QUERY, b"rt=oic.r.doxm"),
+                    (ACCEPT, CF_CBOR),
+                ],
+            )
+            for address in addresses:
+                sock.sendto(request, (address, OCF_DISCOVERY_PORT))
+
+            deadline = time.monotonic() + per_attempt_timeout
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                sock.settimeout(remaining)
+                try:
+                    datagram, peer = sock.recvfrom(65535)
+                except TimeoutError:
+                    break
+                if (
+                    peer[0] not in addresses
+                    or len(datagram) > _OCF_DISCOVERY_MAX_DATAGRAM_BYTES
+                    or not datagram
+                    or datagram[0] >> 6 != 1
+                ):
+                    continue
+                try:
+                    _mtype, code, _mid, response_token, options, payload = parse_coap(datagram)
+                except (IndexError, TypeError, ValueError):
+                    continue
+                if code != 0x45 or response_token != token or not payload:
+                    continue
+                # Do not try to decode a partial Block2 body. The filtered
+                # DOXM response is normally one small datagram; falling back
+                # to the legacy scan is safer than assembling unbounded data
+                # during config flow discovery.
+                if any(
+                    number == BLOCK2 and value and int.from_bytes(value, "big") & 0x08
+                    for number, value in options
+                ):
+                    continue
+                if ports := _advertised_secure_ports(payload):
+                    return ports
+    return []
 
 
 def _clienthello_probe(host: str, port: int):
@@ -447,15 +586,30 @@ def _scan_ports(host: str) -> _PortScan:
     own preferred-port rescue.
     """
     try:
-        confirmed = _clienthello_scan(host, PROBE_PORT_RANGE)
+        advertised = _discover_advertised_secure_ports(host)
+    except Exception as exc:
+        _LOGGER.debug("OCF secure-port discovery unavailable (%s); using fallback range", exc)
+        advertised = []
+
+    probe_ports = list(dict.fromkeys([*PROBE_PORT_RANGE, *advertised]))
+    if advertised:
+        _LOGGER.debug("OCF secure port(s) advertised by %s: %s", host, advertised)
+
+    try:
+        confirmed = _clienthello_scan(host, probe_ports)
     except Exception as exc:
         _LOGGER.debug("ClientHello probe unavailable (%s); falling back to UDP sweep", exc)
         confirmed = []
     if confirmed:
         _LOGGER.debug("DTLS port(s) confirmed on %s: %s", host, confirmed)
-        return _PortScan(confirmed, confirmed)
+        return _PortScan(confirmed, confirmed, advertised=tuple(advertised))
 
     sweep, candidates = _sweep_ports(host, PROBE_PORT_RANGE, LIVENESS_PROBE_TIMEOUT_S)
+    # A same-host, token-matched OCF advertisement is stronger evidence than
+    # the ICMP sweep, whose false negatives motivated the preferred-port
+    # rescue in the first place. Keep advertised ports as candidates even if
+    # that fallback sweep rules them out.
+    candidates = list(dict.fromkeys([*advertised, *candidates]))
     # No early "nothing here" fast-fail on an empty sweep: the rescue always
     # keeps PREFERRED_PROBE_PORTS as candidates (issue #192), so a real
     # handshake attempt still happens. What the sweep saw is carried along
@@ -469,7 +623,7 @@ def _scan_ports(host: str) -> _PortScan:
         sweep.unreachable,
         candidates,
     )
-    return _PortScan(candidates, [], sweep)
+    return _PortScan(candidates, [], sweep, tuple(advertised))
 
 
 # TLS alerts (RFC 5246 §7.2) that mean "I looked at your certificate and said
@@ -525,6 +679,8 @@ def _classify_handshake_failure(
     * A confirmed DTLS port that then timed out is a device that is present
       and healthy but wouldn't finish. Usually it's still holding the session
       from a previous attempt, which clears on its own.
+    * An advertised secure OCF port proves the legacy range is not the whole
+      story, even if that endpoint stays silent for our handshake profile.
     * Otherwise the sweep's own shape is the evidence -- see the rules below.
     """
     alerts = [name for name in (_alert_name(exc) for _, exc in failures) if name]
@@ -536,6 +692,11 @@ def _classify_handshake_failure(
     if scan.confirmed:
         return HandshakeTimeout(
             f"DTLS server confirmed on {host}:{scan.confirmed} but the handshake never completed"
+        )
+    if scan.advertised:
+        return NoDtlsServer(
+            f"{host} advertised secure OCF port(s) {scan.advertised}, "
+            "but none answered a DTLS handshake"
         )
 
     sweep = scan.swept

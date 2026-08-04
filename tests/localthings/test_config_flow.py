@@ -177,6 +177,256 @@ def test_sweep_ports_rescues_preferred_ports_the_sweep_missed(
     assert set(candidates) == {preferred_port, live_port}
 
 
+def test_advertised_secure_ports_accepts_only_secure_doxm_links() -> None:
+    """Discovery data must explicitly describe a secure DOXM endpoint."""
+    import cbor2
+
+    from custom_components.localthings.config_flow import _advertised_secure_ports
+
+    payload = cbor2.dumps(
+        [
+            {
+                "links": [
+                    {
+                        "href": "/oic/sec/doxm",
+                        "rt": ["oic.r.doxm"],
+                        "p": {"sec": True, "port": 49872},
+                    },
+                    {
+                        "href": "/oic/sec/doxm",
+                        "rt": ["oic.r.doxm"],
+                        "p": {"sec": True, "port": 49872},
+                    },
+                    {
+                        "href": "/oic/sec/doxm",
+                        "rt": ["oic.r.doxm"],
+                        "p": {"sec": False, "port": 49901},
+                    },
+                    {
+                        "href": "/oic/sec/pstat",
+                        "rt": ["oic.r.pstat"],
+                        "p": {"sec": True, "port": 49902},
+                    },
+                    {
+                        "href": "/oic/sec/doxm",
+                        "rt": ["oic.r.doxm"],
+                        "p": {"sec": True, "port": True},
+                    },
+                    {
+                        "href": "/oic/sec/doxm",
+                        "rt": ["oic.r.doxm"],
+                        "p": {"sec": True, "port": 65536},
+                    },
+                ]
+            }
+        ]
+    )
+
+    assert _advertised_secure_ports(payload) == [49872]
+    assert _advertised_secure_ports(b"not-cbor") == []
+
+
+def test_ocf_discovery_accepts_dynamic_response_source_port(
+    socket_enabled,
+    monkeypatch,
+) -> None:
+    """Samsung can receive discovery on 5683 and reply from another port."""
+    import socket
+    import threading
+
+    import cbor2
+    from smartthings_local.protocol.coap import TYPE_NON, build_coap, parse_coap
+
+    from custom_components.localthings import config_flow
+
+    listener = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.settimeout(1.0)
+    discovery_port = listener.getsockname()[1]
+
+    responder = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    responder.bind(("127.0.0.1", 0))
+    assert responder.getsockname()[1] != discovery_port
+
+    monkeypatch.setattr(config_flow, "OCF_DISCOVERY_PORT", discovery_port)
+    monkeypatch.setattr(config_flow, "OCF_DISCOVERY_TIMEOUT_S", 0.4)
+    monkeypatch.setattr(config_flow, "OCF_DISCOVERY_RETRIES", 2)
+    mids = iter((0x1001, 0x1002))
+    monkeypatch.setattr(config_flow.secrets, "randbits", lambda bits: next(mids))
+
+    payload = cbor2.dumps(
+        [
+            {
+                "links": [
+                    {
+                        "href": "/oic/sec/doxm",
+                        "rt": ["oic.r.doxm"],
+                        "p": {"sec": True, "port": 49872},
+                    }
+                ]
+            }
+        ]
+    )
+    errors: list[Exception] = []
+
+    def _respond() -> None:
+        try:
+            first_request, peer = listener.recvfrom(65535)
+            _mtype, _code, first_mid, token, _options, _payload = parse_coap(first_request)
+            second_request, second_peer = listener.recvfrom(65535)
+            _mtype, _code, mid, second_token, _options, _payload = parse_coap(second_request)
+            assert second_peer == peer
+            assert first_mid != mid
+            assert second_token == token
+
+            # A response from the target host with the wrong token is ignored.
+            wrong_token = bytes([token[0] ^ 0xFF, *token[1:]])
+            stray = build_coap(TYPE_NON, 0x45, mid, wrong_token, [], payload)
+            responder.sendto(stray, peer)
+
+            # The valid response comes from the target host, but deliberately
+            # not from the request's discovery port.
+            response = build_coap(TYPE_NON, 0x45, mid, token, [], payload)
+            responder.sendto(response, peer)
+        except Exception as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    thread = threading.Thread(target=_respond)
+    thread.start()
+    try:
+        ports = config_flow._discover_advertised_secure_ports("127.0.0.1")
+    finally:
+        thread.join(timeout=2.0)
+        listener.close()
+        responder.close()
+
+    assert not thread.is_alive()
+    assert errors == []
+    assert ports == [49872]
+
+
+def test_ocf_discovery_rejects_response_from_another_host(monkeypatch) -> None:
+    """A valid token and payload cannot redirect scans from another IP."""
+    import cbor2
+    from smartthings_local.protocol.coap import TYPE_NON, build_coap
+
+    from custom_components.localthings import config_flow
+
+    token = b"test"
+    payload = cbor2.dumps(
+        [
+            {
+                "links": [
+                    {
+                        "href": "/oic/sec/doxm",
+                        "rt": ["oic.r.doxm"],
+                        "p": {"sec": True, "port": 49872},
+                    }
+                ]
+            }
+        ]
+    )
+    response = build_coap(TYPE_NON, 0x45, 0x1001, token, [], payload)
+
+    class _FakeSocket:
+        def __init__(self, *args, **kwargs):
+            self.responses = [
+                (response, ("192.0.2.2", 40000)),
+                (response, ("192.0.2.1", 40001)),
+            ]
+            self.sent_to: list[tuple[str, int]] = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def settimeout(self, timeout):
+            pass
+
+        def sendto(self, datagram, peer):
+            self.sent_to.append(peer)
+
+        def recvfrom(self, size):
+            return self.responses.pop(0)
+
+    fake_socket = _FakeSocket()
+    monkeypatch.setattr(config_flow.secrets, "token_bytes", lambda size: token)
+    monkeypatch.setattr(
+        config_flow.socket,
+        "getaddrinfo",
+        lambda host, port, **kwargs: [
+            (
+                config_flow.socket.AF_INET,
+                config_flow.socket.SOCK_DGRAM,
+                17,
+                "",
+                ("192.0.2.1", port),
+            )
+        ],
+    )
+    monkeypatch.setattr(config_flow.socket, "socket", lambda *args, **kwargs: fake_socket)
+    monkeypatch.setattr(config_flow, "OCF_DISCOVERY_RETRIES", 1)
+
+    ports = config_flow._discover_advertised_secure_ports("192.0.2.1")
+
+    assert ports == [49872]
+    assert fake_socket.sent_to == [("192.0.2.1", config_flow.OCF_DISCOVERY_PORT)]
+
+
+def test_scan_probes_device_advertised_port(monkeypatch) -> None:
+    """A secure port outside the legacy range reaches the DTLS probe."""
+    from custom_components.localthings import config_flow
+
+    monkeypatch.setattr(
+        config_flow,
+        "_discover_advertised_secure_ports",
+        lambda host: [49872],
+    )
+    probed = _patch_clienthello(monkeypatch, {49872})
+
+    def _no_sweep(host, ports, timeout):
+        raise AssertionError("UDP sweep must not run once a port is confirmed")
+
+    monkeypatch.setattr(config_flow, "_sweep_ports", _no_sweep)
+
+    scan = config_flow._scan_ports("192.0.2.1")
+
+    assert set(probed) == {*config_flow.PROBE_PORT_RANGE, 49872}
+    assert scan.confirmed == [49872]
+    assert scan.candidates == [49872]
+
+
+def test_scan_keeps_advertised_port_when_clienthello_is_unavailable(monkeypatch) -> None:
+    """A strong OCF advertisement survives the legacy sweep fallback."""
+    from custom_components.localthings import config_flow
+
+    monkeypatch.setattr(
+        config_flow,
+        "_discover_advertised_secure_ports",
+        lambda host: [49872],
+    )
+
+    def _unavailable(host, ports):
+        raise ImportError("probe unavailable")
+
+    monkeypatch.setattr(config_flow, "_clienthello_scan", _unavailable)
+    sweep = _sweep_result(refused=config_flow.PROBE_PORT_RANGE)
+    monkeypatch.setattr(
+        config_flow,
+        "_sweep_ports",
+        lambda host, ports, timeout: (sweep, [49154, 49155]),
+    )
+
+    scan = config_flow._scan_ports("192.0.2.1")
+
+    assert scan.confirmed == []
+    assert scan.candidates == [49872, 49154, 49155]
+    assert scan.swept is sweep
+    assert scan.advertised == (49872,)
+
+
 WASHER_DEVICE0 = [
     {"rt": ["x.com.samsung.devcol"]},
     {
@@ -231,6 +481,7 @@ def fake_dtls(monkeypatch):
 
     FakeSession.instances = []
     FakeSession.reject_certs = set()
+    monkeypatch.setattr(config_flow, "_discover_advertised_secure_ports", lambda host: [])
     monkeypatch.setattr(config_flow, "_fetch_samsung_uuid", lambda: "test-uuid")
     monkeypatch.setattr(
         config_flow,
@@ -488,10 +739,10 @@ def _sweep_result(live=(), refused=(), unreachable=()):
     return _SweepResult(list(live), list(refused), list(unreachable))
 
 
-def _scan(confirmed=(), swept=None, candidates=(49154,)):
+def _scan(confirmed=(), swept=None, candidates=(49154,), advertised=()):
     from custom_components.localthings.config_flow import _PortScan
 
-    return _PortScan(list(candidates), list(confirmed), swept)
+    return _PortScan(list(candidates), list(confirmed), swept, tuple(advertised))
 
 
 def _openssl_alert(name: str) -> ConnectionError:
@@ -567,6 +818,28 @@ def test_every_port_refused_is_reported_as_closed_ports() -> None:
     )
     assert isinstance(err, PortsClosed)
     assert err.error_key == "ports_closed"
+
+
+def test_advertised_port_is_not_misreported_as_legacy_ports_closed() -> None:
+    """Public OCF evidence survives when its secure port stays silent."""
+    from custom_components.localthings.config_flow import (
+        PROBE_PORT_RANGE,
+        NoDtlsServer,
+        _classify_handshake_failure,
+    )
+
+    err = _classify_handshake_failure(
+        MOCK_HOST,
+        _scan(
+            candidates=[49872],
+            advertised=[49872],
+            swept=_sweep_result(refused=PROBE_PORT_RANGE),
+        ),
+        [(49872, TimeoutError("handshake timeout"))],
+    )
+
+    assert isinstance(err, NoDtlsServer)
+    assert err.error_key == "no_dtls_server"
 
 
 def test_unreachable_host_is_not_reported_as_closed_ports() -> None:

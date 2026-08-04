@@ -59,11 +59,19 @@ CONF_BYPASS_REMOTE_CONTROL = "bypass_remote_control_lock"
 CONF_FINISH_TIME_HYSTERESIS_MINUTES = "finish_time_hysteresis_minutes"
 DEFAULT_FINISH_TIME_HYSTERESIS_MINUTES = 3
 
-# The DTLS/CoAP local API binds somewhere in this ephemeral range; which port
-# depends on firmware. Newer builds answer on 49154/49155, but older ones have
-# been seen as low as 49153, so we sweep the whole range for a live UDP port
-# before attempting the (expensive) DTLS handshake.
+# Legacy appliances bind the DTLS/CoAP local API somewhere in this ephemeral
+# range. Newer OCF appliances can advertise a secure port outside it, so the
+# config flow first asks the device's public discovery endpoint and merges any
+# validated advertised port into this bounded fallback range.
 PROBE_PORT_RANGE = list(range(49152, 49161))
+
+# Public OCF discovery endpoint used to locate a device-advertised secure
+# DOXM port. Samsung firmware can answer a request sent to 5683 from a
+# different ephemeral source port, so callers must validate the response IP
+# and CoAP token rather than requiring the source port to remain 5683.
+OCF_DISCOVERY_PORT = 5683
+OCF_DISCOVERY_TIMEOUT_S = 1.0
+OCF_DISCOVERY_RETRIES = 2
 
 # Ports we've historically seen complete a DTLS handshake. When more than one
 # port in the range looks live, these are tried first.
